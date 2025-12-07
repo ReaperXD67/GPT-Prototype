@@ -1,0 +1,21 @@
+# 1. Ignore the Virtual Environment (Crucial!)
+gpt_proto_env/
+venv/
+env/
+__pycache__/
+*.pyc
+
+# 2. Ignore Large Model Checkpoints (Optional but recommended)
+# If you want to share the model, remove these lines.
+# But usually, we don't push large binary files to standard Git.
+*.pth
+*.pt
+*.bin
+
+# 3. Ignore IDE settings
+.vscode/
+.idea/
+
+# 4. Ignore Dataset Cache (if any local files exist)
+*.parquet
+cache/
