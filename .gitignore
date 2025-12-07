@@ -19,3 +19,9 @@ __pycache__/
 # 4. Ignore Dataset Cache (if any local files exist)
 *.parquet
 cache/
+
+# Ignore tokenizer + experiment configs
+*.json
+
+# But keep config JSONs if needed (optional)
+!config.json

@@ -10,7 +10,7 @@ from model import BabyGPT, ModelConfig
 # ==========================================
 # EXPERIMENT CONTROL
 # Change this to "swiglu" or "deep_res_mlp"
-SELECTED_FFN_TYPE = "deep_res_mlp"  
+SELECTED_FFN_TYPE = "gated_deep_mlp"
 # ==========================================
 
 # HYPERPARAMETERS

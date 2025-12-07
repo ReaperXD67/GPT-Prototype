@@ -5,17 +5,34 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 # --- 1. CONFIGURATION ---
-class ModelConfig:
-    def __init__(self, ffn_type="swiglu"):
+
+class Phase1Config:
+    """Config for the 2M 'Baby' Model (Fast Testing)"""
+    def __init__(self, ffn_type="gated_deep_mlp"):
         self.vocab_size = 4096
         self.d_model = 128
         self.n_layer = 4
         self.n_head = 4
         self.block_size = 256
         self.dropout = 0.0
-        self.ffn_type = ffn_type # 'swiglu' or 'deep_res_mlp'
+        self.ffn_type = ffn_type 
+
+class Phase2Config:
+    """Config for the 50M 'Tank' Model (The Big Bet)"""
+    def __init__(self, ffn_type="gated_deep_mlp"):
+        self.vocab_size = 4096    # Keep small for stability
+        self.d_model = 512        # Width: 4x larger
+        self.n_layer = 6          # Depth: Deeper
+        self.n_head = 8           # Heads: More parallel processing
+        self.block_size = 512     # Context: 2x longer
+        self.dropout = 0.0
+        self.ffn_type = ffn_type
+
+# Default generic config
+ModelConfig = Phase1Config 
 
 # --- 2. LAYERS ---
+
 class RMSNorm(nn.Module):
     def __init__(self, dim, eps=1e-6):
         super().__init__()
@@ -27,7 +44,7 @@ class RMSNorm(nn.Module):
         x_normed = x * torch.rsqrt(var + self.eps)
         return self.weight * x_normed
 
-# OPTION A: SwiGLU (Standard)
+# OPTION A: SwiGLU (The Standard Baseline)
 class SwiGLU(nn.Module):
     def __init__(self, dim):
         super().__init__()
@@ -39,48 +56,50 @@ class SwiGLU(nn.Module):
     def forward(self, x):
         return self.w_out(F.silu(self.w_gate(x)) * self.w_val(x))
 
-# OPTION B: DeepResMLP (Custom 4-Layer ResNet)
-class DeepResMLP(nn.Module):
+# OPTION B: GatedDeepMLP (The 'High-Dim Highway')
+# This is the "Best" custom architecture we designed.
+# It keeps data in high dimensions (512 -> 2048) while processing, avoiding bottlenecks.
+class GatedDeepMLP(nn.Module):
     def __init__(self, dim):
         super().__init__()
-        # Configured for 4x width expansion
-        hidden_dim = dim * 4 
+        hidden_dim = dim * 4 # Tank Width (e.g., 512 -> 2048)
         
-        # Layer 1: Expand
+        # 1. Expand
         self.in_proj = nn.Linear(dim, hidden_dim)
         
-        # Internal Residual Loop
-        self.fc1 = nn.Linear(hidden_dim, hidden_dim)
-        self.act1 = nn.GELU()
-        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
-        self.act2 = nn.GELU()
+        # 2. Deep Gated Processing Loop
+        # We process the data TWICE in the high-dimensional space
+        self.gate1 = nn.Linear(hidden_dim, hidden_dim)
+        self.val1  = nn.Linear(hidden_dim, hidden_dim)
         
-        # Layer 4: Contract
+        self.gate2 = nn.Linear(hidden_dim, hidden_dim)
+        self.val2  = nn.Linear(hidden_dim, hidden_dim)
+        
+        # 3. Contract
         self.out_proj = nn.Linear(hidden_dim, dim)
         
-        # Scale weights to prevent instability in deep residuals
-        self.apply(self._init_res_weights)
-
-    def _init_res_weights(self, module):
-        if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            if module.bias is not None:
-                torch.nn.init.zeros_(module.bias)
+        # ZERO-INIT TRICK: 
+        # Initialize output to zero so the block starts as an identity function.
+        # This speeds up convergence massively for deep networks.
+        nn.init.zeros_(self.out_proj.weight)
+        nn.init.zeros_(self.out_proj.bias)
 
     def forward(self, x):
         # 1. Expand
         x = self.in_proj(x)
         
-        # 2. Residual Block
+        # 2. Deep Processing
         residual = x
-        x = self.fc1(x)
-        x = self.act1(x)
-        x = self.fc2(x)
         
-        # Residual Connection
-        x = x + residual 
-        x = self.act2(x)
-
+        # Gated Operation 1
+        x = F.silu(self.gate1(x)) * self.val1(x)
+        
+        # Gated Operation 2
+        x = F.silu(self.gate2(x)) * self.val2(x)
+        
+        # Residual connection inside the high-dim space
+        x = x + residual
+        
         # 3. Contract
         x = self.out_proj(x)
         return x
@@ -100,14 +119,15 @@ class CausalSelfAttention(nn.Module):
         B, T, C = x.size()
         qkv = self.c_attn(x)
         q, k, v = qkv.split(C, dim=2)
+        
+        # Reshape for Attention: (B, T, n_head, d_head) -> (B, n_head, T, d_head)
         q = q.view(B, T, self.n_head, self.d_head).transpose(1, 2)
         k = k.view(B, T, self.n_head, self.d_head).transpose(1, 2)
         v = v.view(B, T, self.n_head, self.d_head).transpose(1, 2)
         
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-        att = F.softmax(att, dim=-1)
-        y = att @ v
+        # --- FLASH ATTENTION OPTIMIZATION ---
+        # PyTorch 2.0+ automatically uses FlashAttention-2 on RTX 4070 if available
+        y = F.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=0.0, is_causal=True)
         
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         return self.c_proj(y)
@@ -116,15 +136,16 @@ class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.attn = CausalSelfAttention(config)
-        
-        # Select FFN type based on config
-        if config.ffn_type == "swiglu":
-            self.ffn = SwiGLU(config.d_model)
-        elif config.ffn_type == "deep_res_mlp":
-            self.ffn = DeepResMLP(config.d_model)
-            
         self.ln1 = RMSNorm(config.d_model)
         self.ln2 = RMSNorm(config.d_model)
+        
+        # SELECTOR
+        if config.ffn_type == "swiglu":
+            self.ffn = SwiGLU(config.d_model)
+        elif config.ffn_type == "gated_deep_mlp":
+            self.ffn = GatedDeepMLP(config.d_model)
+        else:
+            raise ValueError(f"Unknown ffn_type: {config.ffn_type}")
 
     def forward(self, x):
         x = x + self.attn(self.ln1(x))
@@ -140,7 +161,10 @@ class BabyGPT(nn.Module):
         self.blocks = nn.Sequential(*[Block(config) for _ in range(config.n_layer)])
         self.ln_f = RMSNorm(config.d_model)
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
-        self.token_embedding.weight = self.lm_head.weight # Weight Tying
+        
+        # Weight Tying (Standard Practice)
+        self.token_embedding.weight = self.lm_head.weight
+        
         self.apply(self._init_weights)
 
     def _init_weights(self, module):
