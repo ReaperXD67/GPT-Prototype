@@ -20,8 +20,9 @@ class Phase1Config:
 class Phase2Config:
     """Config for the 50M 'Tank' Model (The Big Bet)"""
     def __init__(self, ffn_type="gated_deep_mlp"):
-        self.vocab_size = 4096    # Keep small for stability
-        self.d_model = 512        # Width: 4x larger
+        # OPTIMIZED FOR 8GB VRAM
+        self.vocab_size = 4096    # Keep small to save VRAM for layers
+        self.d_model = 512        # Width: 4x larger (The Tank)
         self.n_layer = 6          # Depth: Deeper
         self.n_head = 8           # Heads: More parallel processing
         self.block_size = 512     # Context: 2x longer
@@ -56,9 +57,8 @@ class SwiGLU(nn.Module):
     def forward(self, x):
         return self.w_out(F.silu(self.w_gate(x)) * self.w_val(x))
 
-# OPTION B: GatedDeepMLP (The 'High-Dim Highway')
-# This is the "Best" custom architecture we designed.
-# It keeps data in high dimensions (512 -> 2048) while processing, avoiding bottlenecks.
+# OPTION B: GatedDeepMLP (The 'Tank' Architecture)
+# Best for Phase 2: High-Dimensional processing with Gating + Zero-Init
 class GatedDeepMLP(nn.Module):
     def __init__(self, dim):
         super().__init__()
@@ -126,7 +126,7 @@ class CausalSelfAttention(nn.Module):
         v = v.view(B, T, self.n_head, self.d_head).transpose(1, 2)
         
         # --- FLASH ATTENTION OPTIMIZATION ---
-        # PyTorch 2.0+ automatically uses FlashAttention-2 on RTX 4070 if available
+        # Automatically uses FlashAttention-2 on RTX 4070
         y = F.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=0.0, is_causal=True)
         
         y = y.transpose(1, 2).contiguous().view(B, T, C)
@@ -145,7 +145,8 @@ class Block(nn.Module):
         elif config.ffn_type == "gated_deep_mlp":
             self.ffn = GatedDeepMLP(config.d_model)
         else:
-            raise ValueError(f"Unknown ffn_type: {config.ffn_type}")
+            # Fallback for old configs if needed
+            self.ffn = SwiGLU(config.d_model)
 
     def forward(self, x):
         x = x + self.attn(self.ln1(x))

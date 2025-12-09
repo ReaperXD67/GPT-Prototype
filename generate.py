@@ -1,93 +1,104 @@
+# FILE: generate.py
 import torch
 import torch.nn.functional as F
-from model import BabyGPT, ModelConfig
+from model import BabyGPT, Phase2Config
 from tokenizers import Tokenizer
 import os
 
-# --- CONFIGURATION ---
-# Which model do you want to talk to?
-MODEL_PATH = "babygpt_gated_deep_mlp.pth" 
-# MODEL_PATH = "babygpt_gated_deep_mlp.pth" 
-
-# Must match exactly what you used in train.py (Phase 1)
-TYPE = "swiglu" if "swiglu" in MODEL_PATH else "gated_deep_mlp"
+# --- ⚙️ CONFIGURATION ---
+MODEL_PATH = "checkpoint_latest.pth"
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-# 1. Load Tokenizer
+# 1. LOAD TOKENIZER
 if not os.path.exists("tokenizer_phase1.json"):
-    print("Error: Tokenizer not found.")
+    print("❌ Error: tokenizer_phase1.json not found.")
     exit()
 tokenizer = Tokenizer.from_file("tokenizer_phase1.json")
 
-# 2. Initialize Model (Empty Brain)
-print(f"Loading {TYPE} model from {MODEL_PATH}...")
-config = ModelConfig(ffn_type=TYPE)
-
-# --- CRITICAL: MATCH PHASE 1 PARAMS ---
-config.vocab_size = 4096
-config.d_model = 128
-config.n_layer = 4
-config.n_head = 4
-config.block_size = 256
-# --------------------------------------
+# 2. INITIALIZE MODEL (50M TANK CONFIG)
+print(f"[INFO] Initializing Phase 2 Model...")
+config = Phase2Config(ffn_type="gated_deep_mlp")
+config.vocab_size = tokenizer.get_vocab_size()
 
 model = BabyGPT(config).to(DEVICE)
 
-# 3. Load Trained Weights (The Knowledge)
+# 3. LOAD WEIGHTS
+print(f"[INFO] Loading weights from {MODEL_PATH}...")
 try:
-    state_dict = torch.load(MODEL_PATH, map_location=DEVICE)
-    model.load_state_dict(state_dict)
-    print("Weights loaded successfully!")
-except FileNotFoundError:
-    print(f"Error: Could not find {MODEL_PATH}. Did you train it?")
-    exit()
+    checkpoint = torch.load(MODEL_PATH, map_location=DEVICE)
+    if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+        state_dict = checkpoint["model_state_dict"]
+    else:
+        state_dict = checkpoint
+
+    clean_state_dict = {}
+    for k, v in state_dict.items():
+        new_k = k.replace('_orig_mod.', '').replace('module.', '')
+        clean_state_dict[new_k] = v
+        
+    model.load_state_dict(clean_state_dict)
+    print("✅ Weights loaded.")
 except Exception as e:
-    print(f"Error loading weights: {e}")
+    print(f"❌ Error: {e}")
     exit()
 
-model.eval() # Switch to "Testing Mode"
+model.eval()
 
-# 4. Generation Loop
-def generate_text(prompt, max_tokens=100, temperature=1.0):
-    # Encode prompt
-    input_ids = tokenizer.encode(prompt).ids
-    input_tensor = torch.tensor([input_ids], dtype=torch.long).to(DEVICE)
+# 4. GENERATION FUNCTION (FINAL BUG FIX 🐛)
+def generate_text(prompt, max_tokens=150, temperature=0.8, top_k=50, repetition_penalty=1.2):
+    
+    encoded = tokenizer.encode(prompt).ids
+    input_tensor = torch.tensor([encoded], dtype=torch.long).to(DEVICE)
     
     print(f"\nPrompt: {prompt}")
     print("Generating...", end="", flush=True)
     
-    # Loop to generate tokens one by one
     for _ in range(max_tokens):
-        # Crop context if it gets too long
         idx_cond = input_tensor[:, -config.block_size:]
         
-        # Get predictions
         with torch.no_grad():
             logits, _ = model(idx_cond)
         
-        # Focus on the last step
-        logits = logits[:, -1, :] / temperature
-        probs = F.softmax(logits, dim=-1)
+        logits = logits[:, -1, :] 
         
-        # Sample (Pick the next word)
+        # --- 🛡️ FINAL CORRECTED REPETITION PENALTY ---
+        # Apply penalty ONLY to previously used tokens
+        # Handle positive/negative scores correctly
+        for token_id in set(input_tensor[0].tolist()):
+            score = logits[0, token_id]
+            if score < 0:
+                logits[0, token_id] = score * repetition_penalty
+            else:
+                logits[0, token_id] = score / repetition_penalty
+        # ---------------------------------------------
+
+        logits = logits / temperature
+        
+        # Top-K Sampling
+        if top_k is not None:
+            v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+            logits[logits < v[:, [-1]]] = -float('Inf')
+
+        probs = F.softmax(logits, dim=-1)
         idx_next = torch.multinomial(probs, num_samples=1)
         
-        # Append to sequence
         input_tensor = torch.cat((input_tensor, idx_next), dim=1)
-        
-        # Live Stream Print (Optional)
-        # new_word = tokenizer.decode([idx_next.item()])
-        # print(new_word, end="", flush=True)
 
-    # Decode final result
-    output_text = tokenizer.decode(input_tensor[0].tolist())
-    return output_text
+    return tokenizer.decode(input_tensor[0].tolist())
 
-# 5. Run it
+# 5. UI
+print("\n--- 🤖 BABY GPT (PHASE 2) ---")
+print("Settings: Temp=0.8, RepetitionPenalty=1.2")
 while True:
-    user_input = input("\n\nType a prompt (or 'q' to quit): ")
-    if user_input.lower() == 'q': break
-    
-    generated = generate_text(user_input, max_tokens=100, temperature=0.8)
-    print("\n--- RESULT ---")
-    print(generated)
+    try:
+        user_input = input("\nType a prompt (or 'q'): ")
+        if user_input.lower() in ['q', 'exit']: break
+        
+        # Use the default settings defined in the function header
+        generated = generate_text(user_input) 
+        print("\n\n--- RESULT ---")
+        print(generated)
+        print("----------------")
+        
+    except KeyboardInterrupt:
+        break
