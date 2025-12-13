@@ -12,7 +12,7 @@ from model import Phase2Config, BabyGPT
 SELECTED_FFN_TYPE = "gated_deep_mlp" 
 
 # PRO SETTINGS
-MAX_ITERS = 50000       
+MAX_ITERS = 150000       
 BATCH_SIZE = 16         # Physical Batch (Keeps VRAM safe)
 GRAD_ACCUM_STEPS = 4    # <--- NEW! Simulates Batch Size 64 (16 * 4)
 BLOCK_SIZE = 512        

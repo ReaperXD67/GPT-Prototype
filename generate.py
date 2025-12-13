@@ -6,7 +6,8 @@ from tokenizers import Tokenizer
 import os
 
 # --- ⚙️ CONFIGURATION ---
-MODEL_PATH = "checkpoint_latest.pth"
+# It will look for the latest checkpoint automatically
+MODEL_PATH = "checkpoint_latest.pth" 
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 # 1. LOAD TOKENIZER
@@ -15,36 +16,46 @@ if not os.path.exists("tokenizer_phase1.json"):
     exit()
 tokenizer = Tokenizer.from_file("tokenizer_phase1.json")
 
-# 2. INITIALIZE MODEL (50M TANK CONFIG)
-print(f"[INFO] Initializing Phase 2 Model...")
-config = Phase2Config(ffn_type="gated_deep_mlp")
+# 2. INITIALIZE MODEL
+# This automatically uses the class defined in your updated model.py
+print(f"[INFO] Initializing Phase 2 Model (50M Tank)...")
+config = Phase2Config(ffn_type="gated_deep_mlp") 
 config.vocab_size = tokenizer.get_vocab_size()
 
 model = BabyGPT(config).to(DEVICE)
 
-# 3. LOAD WEIGHTS
+# 3. SMART WEIGHT LOADER
 print(f"[INFO] Loading weights from {MODEL_PATH}...")
 try:
     checkpoint = torch.load(MODEL_PATH, map_location=DEVICE)
+    
+    # Check if it's a full training state (with optimizer) or just weights
     if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+        print("   📦 Detected Full Checkpoint. Extracting model weights...")
         state_dict = checkpoint["model_state_dict"]
     else:
+        print("   💾 Detected Weights-Only File. Loading directly...")
         state_dict = checkpoint
 
+    # Clean up key names (remove 'module.' or '_orig_mod.' prefixes)
     clean_state_dict = {}
     for k, v in state_dict.items():
         new_k = k.replace('_orig_mod.', '').replace('module.', '')
         clean_state_dict[new_k] = v
         
     model.load_state_dict(clean_state_dict)
-    print("✅ Weights loaded.")
+    print("✅ Weights loaded successfully!")
+
+except FileNotFoundError:
+    print(f"❌ Error: {MODEL_PATH} not found. Train the model first!")
+    exit()
 except Exception as e:
-    print(f"❌ Error: {e}")
+    print(f"❌ Error loading weights: {e}")
     exit()
 
 model.eval()
 
-# 4. GENERATION FUNCTION (FINAL BUG FIX 🐛)
+# 4. GENERATION FUNCTION
 def generate_text(prompt, max_tokens=150, temperature=0.8, top_k=50, repetition_penalty=1.2):
     
     encoded = tokenizer.encode(prompt).ids
@@ -54,23 +65,26 @@ def generate_text(prompt, max_tokens=150, temperature=0.8, top_k=50, repetition_
     print("Generating...", end="", flush=True)
     
     for _ in range(max_tokens):
+        # Crop context if it gets too long
         idx_cond = input_tensor[:, -config.block_size:]
         
         with torch.no_grad():
             logits, _ = model(idx_cond)
         
+        # Focus on the last token
         logits = logits[:, -1, :] 
         
-        # --- 🛡️ FINAL CORRECTED REPETITION PENALTY ---
-        # Apply penalty ONLY to previously used tokens
-        # Handle positive/negative scores correctly
+        # --- 🛡️ CORRECTED REPETITION PENALTY ---
+        # Penalize tokens that have already been generated
         for token_id in set(input_tensor[0].tolist()):
             score = logits[0, token_id]
+            # If negative, multiply to make it lower (more negative)
+            # If positive, divide to make it lower (less positive)
             if score < 0:
                 logits[0, token_id] = score * repetition_penalty
             else:
                 logits[0, token_id] = score / repetition_penalty
-        # ---------------------------------------------
+        # ---------------------------------------
 
         logits = logits / temperature
         
@@ -86,7 +100,7 @@ def generate_text(prompt, max_tokens=150, temperature=0.8, top_k=50, repetition_
 
     return tokenizer.decode(input_tensor[0].tolist())
 
-# 5. UI
+# 5. USER INTERFACE
 print("\n--- 🤖 BABY GPT (PHASE 2) ---")
 print("Settings: Temp=0.8, RepetitionPenalty=1.2")
 while True:
@@ -94,8 +108,7 @@ while True:
         user_input = input("\nType a prompt (or 'q'): ")
         if user_input.lower() in ['q', 'exit']: break
         
-        # Use the default settings defined in the function header
-        generated = generate_text(user_input) 
+        generated = generate_text(user_input)
         print("\n\n--- RESULT ---")
         print(generated)
         print("----------------")
