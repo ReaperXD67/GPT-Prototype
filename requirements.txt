@@ -1,0 +1,10 @@
+torch>=2.2.0
+numpy<2.0.0
+transformers
+datasets>=2.19.0
+tokenizers
+bitsandbytes
+matplotlib
+tqdm
+accelerate
+pyarrow>=15.0.0

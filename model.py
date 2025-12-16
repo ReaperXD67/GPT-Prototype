@@ -1,39 +1,80 @@
-# FILE: model.py
+# FILE: model_phase3.py
 import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# --- 1. CONFIGURATION ---
-
-class Phase1Config:
-    """Config for the 2M 'Baby' Model (Fast Testing)"""
-    def __init__(self, ffn_type="gated_deep_mlp"):
-        self.vocab_size = 4096
-        self.d_model = 128
-        self.n_layer = 4
-        self.n_head = 4
-        self.block_size = 256
+# --- CONFIGURATION (124M "Student") ---
+class Phase3Config:
+    def __init__(self, vocab_size=4096):
+        self.vocab_size = vocab_size
+        self.d_model = 768        # Standard 124M Width
+        self.n_layer = 12         # Standard 124M Depth
+        self.n_head = 12          # 12 Heads (64 dim per head)
+        self.block_size = 1024    # Trained Context (Fast)
         self.dropout = 0.0
-        self.ffn_type = ffn_type 
+        self.ffn_type = "gated_deep_mlp"
 
-class Phase2Config:
-    """Config for the 50M 'Tank' Model (The Big Bet)"""
-    def __init__(self, ffn_type="gated_deep_mlp"):
-        # OPTIMIZED FOR 8GB VRAM
-        self.vocab_size = 4096    # Keep small to save VRAM for layers
-        self.d_model = 512        # Width: 4x larger (The Tank)
-        self.n_layer = 6          # Depth: Deeper
-        self.n_head = 8           # Heads: More parallel processing
-        self.block_size = 512     # Context: 2x longer
-        self.dropout = 0.0
-        self.ffn_type = ffn_type
+# --- DYNAMIC YaRN RoPE (Zero-Shot 8k Extension) ---
+class RotaryEmbedding(nn.Module):
+    def __init__(self, dim, max_seq_len=1024, original_max_seq_len=1024, base=10000.0):
+        super().__init__()
+        self.dim = dim
+        self.base = base
+        self.original_max_seq_len = original_max_seq_len
+        self.max_seq_len = max_seq_len
+        self.register_buffer("inv_freq", self._compute_inv_freq(base), persistent=False)
 
-# Default generic config
-ModelConfig = Phase1Config 
+    def _compute_inv_freq(self, base):
+        return 1.0 / (base ** (torch.arange(0, self.dim, 2).float() / self.dim))
 
-# --- 2. LAYERS ---
+    def _yarn_linear_ramp_mask(self, min_val, max_val, num_rotations):
+        if min_val == max_val:
+            return torch.ones_like(num_rotations)
+        mask = (num_rotations - min_val) / (max_val - min_val)
+        return torch.clamp(mask, 0, 1)
 
+    def forward(self, x, seq_len=None):
+        # 1. Determine Scale (Dynamic)
+        current_seq_len = seq_len if seq_len is not None else x.shape[1]
+        scale = max(1.0, current_seq_len / self.original_max_seq_len)
+
+        # 2. Standard RoPE (Short Context - No Change)
+        if scale <= 1.0:
+            t = torch.arange(current_seq_len, device=x.device).type_as(self.inv_freq)
+            freqs = torch.einsum('i,j->ij', t, self.inv_freq)
+            emb = torch.cat((freqs, freqs), dim=-1)
+            return emb.cos()[None, None, :, :], emb.sin()[None, None, :, :]
+
+        # 3. Dynamic YaRN (Long Context Extension)
+        # Calculate new "stretched" base
+        new_base = self.base * (scale ** (self.dim / (self.dim - 2)))
+        inv_freq_yarn = self._compute_inv_freq(new_base).to(x.device)
+        
+        # High/Low Frequency Ramp (Protects local grammar)
+        beta_fast = 32
+        beta_slow = 1
+        dim_indices = torch.arange(0, self.dim, 2, device=x.device).float()
+        ramp = self._yarn_linear_ramp_mask(beta_slow, beta_fast, dim_indices / self.dim)
+        inv_freq_yarn = inv_freq_yarn * (1 - ramp) + (self.inv_freq.to(x.device) / scale) * ramp
+
+        # Temperature Scaling (Entropy Fix)
+        mscale = 0.1 * math.log(scale) + 1.0
+        
+        t = torch.arange(current_seq_len, device=x.device).type_as(inv_freq_yarn)
+        freqs = torch.einsum('i,j->ij', t, inv_freq_yarn)
+        emb = torch.cat((freqs, freqs), dim=-1)
+
+        return (emb.cos() * mscale)[None, None, :, :], (emb.sin() * mscale)[None, None, :, :]
+
+def rotate_half(x):
+    x1, x2 = x[..., :x.shape[-1]//2], x[..., x.shape[-1]//2:]
+    return torch.cat((-x2, x1), dim=-1)
+
+def apply_rotary_pos_emb(q, k, cos, sin):
+    return (q * cos) + (rotate_half(q) * sin), (k * cos) + (rotate_half(k) * sin)
+
+# --- LAYERS ---
 class RMSNorm(nn.Module):
     def __init__(self, dim, eps=1e-6):
         super().__init__()
@@ -42,130 +83,73 @@ class RMSNorm(nn.Module):
 
     def forward(self, x):
         var = torch.mean(x ** 2, dim=-1, keepdim=True)
-        x_normed = x * torch.rsqrt(var + self.eps)
-        return self.weight * x_normed
+        return self.weight * x * torch.rsqrt(var + self.eps)
 
-# OPTION A: SwiGLU (The Standard Baseline)
-class SwiGLU(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        hidden_dim = int(4 * dim) 
-        self.w_gate = nn.Linear(dim, hidden_dim, bias=False)
-        self.w_val  = nn.Linear(dim, hidden_dim, bias=False)
-        self.w_out  = nn.Linear(hidden_dim, dim, bias=False)
-
-    def forward(self, x):
-        return self.w_out(F.silu(self.w_gate(x)) * self.w_val(x))
-
-# OPTION B: GatedDeepMLP (The 'Tank' Architecture)
-# Best for Phase 2: High-Dimensional processing with Gating + Zero-Init
 class GatedDeepMLP(nn.Module):
     def __init__(self, dim):
         super().__init__()
-        hidden_dim = dim * 4 # Tank Width (e.g., 512 -> 2048)
-        
-        # 1. Expand
-        self.in_proj = nn.Linear(dim, hidden_dim)
-        
-        # 2. Deep Gated Processing Loop
-        # We process the data TWICE in the high-dimensional space
-        self.gate1 = nn.Linear(hidden_dim, hidden_dim)
-        self.val1  = nn.Linear(hidden_dim, hidden_dim)
-        
-        self.gate2 = nn.Linear(hidden_dim, hidden_dim)
-        self.val2  = nn.Linear(hidden_dim, hidden_dim)
-        
-        # 3. Contract
-        self.out_proj = nn.Linear(hidden_dim, dim)
-        
-        # ZERO-INIT TRICK: 
-        # Initialize output to zero so the block starts as an identity function.
-        # This speeds up convergence massively for deep networks.
+        hidden_dim = dim * 4
+        self.in_proj = nn.Linear(dim, hidden_dim, bias=False)
+        self.gate1 = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.val1  = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.gate2 = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.val2  = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.out_proj = nn.Linear(hidden_dim, dim, bias=False)
         nn.init.zeros_(self.out_proj.weight)
-        nn.init.zeros_(self.out_proj.bias)
 
     def forward(self, x):
-        # 1. Expand
         x = self.in_proj(x)
-        
-        # 2. Deep Processing
-        residual = x
-        
-        # Gated Operation 1
-        x = F.silu(self.gate1(x)) * self.val1(x)
-        
-        # Gated Operation 2
-        x = F.silu(self.gate2(x)) * self.val2(x)
-        
-        # Residual connection inside the high-dim space
-        x = x + residual
-        
-        # 3. Contract
-        x = self.out_proj(x)
-        return x
+        # SiLU (Swish) is correct for SwiGLU. No GeLU.
+        x = x + F.silu(self.gate1(x)) * self.val1(x)
+        x = x + F.silu(self.gate2(x)) * self.val2(x)
+        return self.out_proj(x)
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
-        assert config.d_model % config.n_head == 0
-        self.c_attn = nn.Linear(config.d_model, 3 * config.d_model, bias=False)
-        self.c_proj = nn.Linear(config.d_model, config.d_model, bias=False)
         self.n_head = config.n_head
         self.d_head = config.d_model // config.n_head
-        self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
-                                     .view(1, 1, config.block_size, config.block_size))
+        self.c_attn = nn.Linear(config.d_model, 3 * config.d_model, bias=False)
+        self.c_proj = nn.Linear(config.d_model, config.d_model, bias=False)
+        self.rotary = RotaryEmbedding(self.d_head, max_seq_len=config.block_size)
 
     def forward(self, x):
         B, T, C = x.size()
         qkv = self.c_attn(x)
         q, k, v = qkv.split(C, dim=2)
-        
-        # Reshape for Attention: (B, T, n_head, d_head) -> (B, n_head, T, d_head)
         q = q.view(B, T, self.n_head, self.d_head).transpose(1, 2)
         k = k.view(B, T, self.n_head, self.d_head).transpose(1, 2)
         v = v.view(B, T, self.n_head, self.d_head).transpose(1, 2)
-        
-        # --- FLASH ATTENTION OPTIMIZATION ---
-        # Automatically uses FlashAttention-2 on RTX 4070
-        y = F.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=0.0, is_causal=True)
-        
+
+        cos, sin = self.rotary(v, seq_len=T)
+        q, k = apply_rotary_pos_emb(q, k, cos, sin)
+
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         return self.c_proj(y)
 
 class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.attn = CausalSelfAttention(config)
         self.ln1 = RMSNorm(config.d_model)
+        self.attn = CausalSelfAttention(config)
         self.ln2 = RMSNorm(config.d_model)
-        
-        # SELECTOR
-        if config.ffn_type == "swiglu":
-            self.ffn = SwiGLU(config.d_model)
-        elif config.ffn_type == "gated_deep_mlp":
-            self.ffn = GatedDeepMLP(config.d_model)
-        else:
-            # Fallback for old configs if needed
-            self.ffn = SwiGLU(config.d_model)
+        self.ffn = GatedDeepMLP(config.d_model)
 
     def forward(self, x):
         x = x + self.attn(self.ln1(x))
         x = x + self.ffn(self.ln2(x))
         return x
 
-class BabyGPT(nn.Module):
+class StudentGPT(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
         self.token_embedding = nn.Embedding(config.vocab_size, config.d_model)
-        self.position_embedding = nn.Embedding(config.block_size, config.d_model)
         self.blocks = nn.Sequential(*[Block(config) for _ in range(config.n_layer)])
         self.ln_f = RMSNorm(config.d_model)
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
-        
-        # Weight Tying (Standard Practice)
         self.token_embedding.weight = self.lm_head.weight
-        
         self.apply(self._init_weights)
 
     def _init_weights(self, module):
@@ -176,19 +160,14 @@ class BabyGPT(nn.Module):
 
     def forward(self, idx, targets=None):
         B, T = idx.size()
-        tok_emb = self.token_embedding(idx)
-        pos_emb = self.position_embedding(torch.arange(T, device=idx.device))
-        x = tok_emb + pos_emb
+        x = self.token_embedding(idx)
         x = self.blocks(x)
         x = self.ln_f(x)
         logits = self.lm_head(x)
-        
         loss = None
         if targets is not None:
             B, T, C = logits.shape
-            logits = logits.view(B*T, C)
-            targets = targets.view(B*T)
-            loss = F.cross_entropy(logits, targets)
+            loss = F.cross_entropy(logits.reshape(B*T, C), targets.reshape(B*T))
         return logits, loss
     
     def get_num_params(self):
