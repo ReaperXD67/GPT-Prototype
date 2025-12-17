@@ -1,167 +1,187 @@
-# FILE: train_phase3.py
-import torch
-import math
 import os
 import time
-from datasets import load_dataset, interleave_datasets
-from tokenizers import Tokenizer
-from model import Phase3Config, StudentGPT
+import math
+import numpy as np
+import torch
+from torch.utils.data import Dataset, DataLoader
+from torch.nn import functional as F
 
-# --- ⚙️ CONFIGURATION ---
-MAX_STEPS = 50000        
-BATCH_SIZE = 32          # 124M fits easily on B200 with batch 32
-GRAD_ACCUM = 4           
-BLOCK_SIZE = 1024        
-LEARNING_RATE = 4e-4     
-WARMUP_STEPS = 2000      
-CHECKPOINT_DIR = "checkpoints_phase3"
-RESUME_FILE = f"{CHECKPOINT_DIR}/latest.pth"
-DEVICE = "cuda"
+# --- IMPORT YOUR MODEL & TOKENIZER ---
+# We assume model.py is in the same folder
+from model import GPT, GPTConfig 
 
-os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-print(f"[INFO] Phase 3: The 124M Student - Dynamic YaRN Edition 🚀")
-
-# 1. LOAD TOKENIZER
-# Note: Using your existing Phase 1 tokenizer (4096)
-if os.path.exists("tokenizer_phase3_new.json"):
-    print("[INFO] Loading Phase 3 tokenizer...")
-    tokenizer_path = "tokenizer_phase3_new.json"
-elif os.path.exists("tokenizer_phase1.json"):
-    print("[INFO] Loading Phase 1 tokenizer (4096)...")
-    tokenizer_path = "tokenizer_phase1.json"
-else:
-    print("❌ Error: No tokenizer found. Upload 'tokenizer_phase1.json'!")
-    exit()
-
-tokenizer = Tokenizer.from_file(tokenizer_path)
-VOCAB_SIZE = tokenizer.get_vocab_size()
-
-# 2. THE DATA MIX (Text + Code + Math)
-def get_data_stream(start_step=0):
-    print("[DATA] Connecting to Open SOTA Streams...")
-    ds_text = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT", split="train", streaming=True)
-    ds_code = load_dataset("HuggingFaceTB/smollm-corpus", "python-edu", split="train", streaming=True)
-    ds_math = load_dataset("microsoft/orca-math-word-problems-200k", split="train", streaming=True)
-
-    dataset = interleave_datasets(
-        [ds_text, ds_code, ds_math], 
-        probabilities=[0.45, 0.35, 0.20], 
-        seed=42
-    )
-    
-    skip_n = start_step * BATCH_SIZE * GRAD_ACCUM
-    if skip_n > 0:
-        print(f"[RESUME] ⏩ Skipping {skip_n} samples...")
-        dataset = dataset.skip(skip_n)
-        
-    return iter(dataset)
-
-# 3. MODEL INIT
-config = Phase3Config(vocab_size=VOCAB_SIZE)
-model = StudentGPT(config).to(DEVICE)
-print(f"[INFO] Model Parameters: {model.get_num_params()/1e6:.2f}M")
-
-print(f"[INFO] Compiling model...")
+# Try to import your custom tokenizer for printing samples. 
+# If it fails, we just won't print text samples during training.
 try:
-    model = torch.compile(model) 
+    from train_tokenizer import Tokenizer
+    tokenizer = Tokenizer("tokenizer_phase3_new.model") # Adjust filename if needed
+    print("✅ Custom tokenizer loaded successfully.")
 except Exception as e:
-    print(f"[WARN] Compilation skipped: {e}")
+    print(f"⚠️ Could not load tokenizer: {e}")
+    print("Training will run, but we won't print sample text.")
+    tokenizer = None
 
-# 4. OPTIMIZER
-optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, betas=(0.9, 0.95), weight_decay=0.1)
-scaler = torch.amp.GradScaler('cuda')
+# -----------------------------------------------------------------------------
+# CONFIGURATION (Edit these settings for your B300/Strong GPU)
+# -----------------------------------------------------------------------------
+batch_size = 64        # B300 is strong, start with 64. If it crashes, try 32.
+block_size = 1024      # Context length (how far back it looks)
+max_iters = 50000      # Total training steps
+eval_interval = 500    # How often to check validation loss
+learning_rate = 3e-4   # Standard starting rate
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+eval_iters = 200       # How many steps to average for "clean" loss reporting
+grad_clip = 1.0        # Prevents gradients from exploding
 
-# 5. RESUME
-start_step = 0
-history = {"loss": [], "ppl": []}
+# Data File (Created by your prepare_data.py script)
+train_data_path = 'train.bin' 
 
-if os.path.exists(RESUME_FILE):
-    print(f"[RESUME] Loading checkpoint...")
-    ckpt = torch.load(RESUME_FILE)
-    model.load_state_dict(ckpt['model'])
-    optimizer.load_state_dict(ckpt['optimizer'])
-    start_step = ckpt['step']
-    history = ckpt['history']
-    print(f"[RESUME] Starting at Step {start_step}")
+# -----------------------------------------------------------------------------
+# PACKED DATASET CLASS (The Fix for Spikes)
+# -----------------------------------------------------------------------------
+class PackedDataset(Dataset):
+    def __init__(self, bin_file, block_size):
+        self.block_size = block_size
+        # memmap reads the giant file from disk without eating all your RAM
+        # We assume data was saved as uint16 (standard for vocab < 65k)
+        if not os.path.exists(bin_file):
+            raise FileNotFoundError(f"CRITICAL: {bin_file} not found! Run prepare_data.py first.")
+            
+        self.data = np.memmap(bin_file, dtype=np.uint16, mode='r')
+        print(f"📂 Loaded dataset '{bin_file}' with {len(self.data)} tokens.")
 
-train_gen = get_data_stream(start_step)
+    def __len__(self):
+        return len(self.data) - self.block_size
 
-def get_lr(step):
-    if step < WARMUP_STEPS: return LEARNING_RATE * (step+1)/(WARMUP_STEPS+1)
-    if step > MAX_STEPS: return LEARNING_RATE * 0.1
-    decay_ratio = (step - WARMUP_STEPS) / (MAX_STEPS - WARMUP_STEPS)
-    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
-    return LEARNING_RATE * 0.1 + coeff * (LEARNING_RATE * 0.9)
+    def __getitem__(self, idx):
+        # Random sampling logic (Great for stable training)
+        # We pick a random spot in the file
+        i = torch.randint(len(self.data) - self.block_size, (1,)).item()
+        
+        # Grab a chunk of data
+        chunk = torch.from_numpy(self.data[i : i + self.block_size + 1].astype(np.int64))
+        
+        # x is input, y is target (next token)
+        x = chunk[:-1]
+        y = chunk[1:]
+        return x, y
 
-# 6. TRAINING LOOP
-model.train()
+# -----------------------------------------------------------------------------
+# HELPER FUNCTIONS
+# -----------------------------------------------------------------------------
+@torch.no_grad()
+def estimate_loss(model, dataloader):
+    """Calculates a clean loss number to check progress."""
+    out = {}
+    model.eval()
+    losses = torch.zeros(eval_iters)
+    
+    # We just run a few batches to get an average
+    data_iter = iter(dataloader)
+    for k in range(eval_iters):
+        try:
+            X, Y = next(data_iter)
+        except StopIteration:
+            data_iter = iter(dataloader)
+            X, Y = next(data_iter)
+            
+        X, Y = X.to(device), Y.to(device)
+        logits, loss = model(X, Y)
+        losses[k] = loss.item()
+        
+    model.train()
+    return losses.mean()
+
+# -----------------------------------------------------------------------------
+# MAIN TRAINING SETUP
+# -----------------------------------------------------------------------------
+# 1. Setup Data
+print("⚙️ Setting up data...")
+dataset = PackedDataset(train_data_path, block_size)
+train_loader = DataLoader(
+    dataset, 
+    batch_size=batch_size, 
+    pin_memory=True, 
+    num_workers=0 # Keep 0 for memmap stability
+)
+
+# 2. Setup Model
+print("🧠 Initializing model...")
+# Note: Ensure your model.py GPTConfig defaults match this, or pass arguments here
+config = GPTConfig(block_size=block_size) 
+model = GPT(config)
+model.to(device)
+
+# Enable torch.compile for speed (Works great on modern Linux/GPUs)
+print("🚀 Compiling model (this takes a minute at the start)...")
+try:
+    model = torch.compile(model)
+except Exception as e:
+    print(f"Note: torch.compile skipped ({e}). Running in standard mode.")
+
+# 3. Setup Optimizer
+optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+
+# -----------------------------------------------------------------------------
+# TRAINING LOOP
+# -----------------------------------------------------------------------------
+print(f"🔥 Training Started on {device}...")
+iter_num = 0
 t0 = time.time()
 
-print("🚀 Training Started...")
-for step in range(start_step, MAX_STEPS):
-    lr = get_lr(step)
-    for param_group in optimizer.param_groups: param_group['lr'] = lr
+# Create an infinite iterator so we don't have to restart the loop
+data_iter = iter(train_loader)
+
+while iter_num < max_iters:
+    # A. Get Batch
+    try:
+        X, Y = next(data_iter)
+    except StopIteration:
+        data_iter = iter(train_loader)
+        X, Y = next(data_iter)
+
+    X, Y = X.to(device), Y.to(device)
+
+    # B. Forward & Backward Pass
+    logits, loss = model(X, Y)
     
     optimizer.zero_grad(set_to_none=True)
-    loss_accum = 0.0
-    step_executed = False  
+    loss.backward()
     
-    for _ in range(GRAD_ACCUM):
-        try:
-            batch_texts = []
-            for _ in range(BATCH_SIZE):
-                sample = next(train_gen)
-                txt = (sample.get('text') or sample.get('content') or sample.get('code') or sample.get('question') or sample.get('source'))
-                if not txt: continue 
-                batch_texts.extend(tokenizer.encode(txt).ids)
-            
-            # Check if batch is valid/full
-            if len(batch_texts) < (BATCH_SIZE * (BLOCK_SIZE + 1)):
-                continue 
-                
-            data = torch.tensor(batch_texts[:(BATCH_SIZE*(BLOCK_SIZE+1))], dtype=torch.long)
-            data = data.view(BATCH_SIZE, BLOCK_SIZE+1).to(DEVICE)
-            x, y = data[:, :-1], data[:, 1:]
-            
-            dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-            with torch.autocast(device_type=DEVICE, dtype=dtype):
-                logits, loss = model(x, y)
-                loss = loss / GRAD_ACCUM
-            
-            scaler.scale(loss).backward()
-            loss_accum += loss.item()
-            step_executed = True
-            
-        except StopIteration:
-            print("[STOP] Dataset exhausted.")
-            break
+    # Clip gradients (Safety belt for training)
+    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+    
+    optimizer.step()
 
-    if step_executed:
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        scaler.step(optimizer)
-        scaler.update()
+    # C. Logging & Evaluation
+    if iter_num % eval_interval == 0:
+        # Calculate accurate loss
+        val_loss = estimate_loss(model, train_loader)
+        dt = time.time() - t0
+        print(f"Step {iter_num}: loss {val_loss:.4f} | time {dt*1000:.2f}ms")
         
-        final_loss = loss_accum * GRAD_ACCUM
-        ppl = math.exp(final_loss) if final_loss < 20 else 1e9
-        history['loss'].append(final_loss)
-        history['ppl'].append(ppl)
-        
-        if step % 50 == 0:
-            dt = time.time() - t0
-            t0 = time.time()
-            print(f"Step {step:05d} | Loss: {final_loss:.4f} | PPL: {ppl:.1f} | LR: {lr:.2e}")
-        
-        if step > 0 and step % 1000 == 0:
-            # 🛡️ AUTO-SAVE TOKENIZER (Fixes the Github issue)
-            tokenizer.save(f"{CHECKPOINT_DIR}/tokenizer.json")
-            
-            torch.save({
-                'step': step,
+        # Save Checkpoint (Safety)
+        if iter_num > 0:
+            checkpoint = {
                 'model': model.state_dict(),
                 'optimizer': optimizer.state_dict(),
-                'history': history
-            }, RESUME_FILE)
-            print(f"💾 Checkpoint & Tokenizer Saved")
+                'iter_num': iter_num,
+                'config': config,
+            }
+            print(f"💾 Saving checkpoint to checkpoint_latest.pth")
+            torch.save(checkpoint, 'checkpoint_latest.pth')
+            
+        # Optional: Print generation if tokenizer exists
+        if tokenizer:
+            try:
+                # Generate a short sample (max_new_tokens=50)
+                context = torch.zeros((1, 1), dtype=torch.long, device=device)
+                print("--- Generating Sample ---")
+                print(tokenizer.decode(model.generate(context, max_new_tokens=50)[0].tolist()))
+                print("-------------------------")
+            except Exception as e:
+                pass # Don't crash if generation fails
 
-print("✅ Training Complete.")
+        t0 = time.time()
+
+    iter_num += 1

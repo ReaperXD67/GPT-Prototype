@@ -1,21 +1,20 @@
-# FILE: model_phase3.py
 import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# --- CONFIGURATION (124M "Student") ---
-class Phase3Config:
-    def __init__(self, vocab_size=4096):
+# --- CONFIGURATION (Renamed to match train.py) ---
+class GPTConfig:
+    def __init__(self, vocab_size=4096, block_size=1024):
         self.vocab_size = vocab_size
         self.d_model = 768        # Standard 124M Width
         self.n_layer = 12         # Standard 124M Depth
         self.n_head = 12          # 12 Heads (64 dim per head)
-        self.block_size = 1024    # Trained Context (Fast)
+        self.block_size = block_size    # Trained Context (Fast)
         self.dropout = 0.0
         self.ffn_type = "gated_deep_mlp"
 
-# --- DYNAMIC YaRN RoPE (Zero-Shot 8k Extension) ---
+# --- DYNAMIC YaRN RoPE ---
 class RotaryEmbedding(nn.Module):
     def __init__(self, dim, max_seq_len=1024, original_max_seq_len=1024, base=10000.0):
         super().__init__()
@@ -35,30 +34,24 @@ class RotaryEmbedding(nn.Module):
         return torch.clamp(mask, 0, 1)
 
     def forward(self, x, seq_len=None):
-        # 1. Determine Scale (Dynamic)
         current_seq_len = seq_len if seq_len is not None else x.shape[1]
         scale = max(1.0, current_seq_len / self.original_max_seq_len)
 
-        # 2. Standard RoPE (Short Context - No Change)
         if scale <= 1.0:
             t = torch.arange(current_seq_len, device=x.device).type_as(self.inv_freq)
             freqs = torch.einsum('i,j->ij', t, self.inv_freq)
             emb = torch.cat((freqs, freqs), dim=-1)
             return emb.cos()[None, None, :, :], emb.sin()[None, None, :, :]
 
-        # 3. Dynamic YaRN (Long Context Extension)
-        # Calculate new "stretched" base
         new_base = self.base * (scale ** (self.dim / (self.dim - 2)))
         inv_freq_yarn = self._compute_inv_freq(new_base).to(x.device)
         
-        # High/Low Frequency Ramp (Protects local grammar)
         beta_fast = 32
         beta_slow = 1
         dim_indices = torch.arange(0, self.dim, 2, device=x.device).float()
         ramp = self._yarn_linear_ramp_mask(beta_slow, beta_fast, dim_indices / self.dim)
         inv_freq_yarn = inv_freq_yarn * (1 - ramp) + (self.inv_freq.to(x.device) / scale) * ramp
 
-        # Temperature Scaling (Entropy Fix)
         mscale = 0.1 * math.log(scale) + 1.0
         
         t = torch.arange(current_seq_len, device=x.device).type_as(inv_freq_yarn)
@@ -99,7 +92,6 @@ class GatedDeepMLP(nn.Module):
 
     def forward(self, x):
         x = self.in_proj(x)
-        # SiLU (Swish) is correct for SwiGLU. No GeLU.
         x = x + F.silu(self.gate1(x)) * self.val1(x)
         x = x + F.silu(self.gate2(x)) * self.val2(x)
         return self.out_proj(x)
@@ -141,7 +133,8 @@ class Block(nn.Module):
         x = x + self.ffn(self.ln2(x))
         return x
 
-class StudentGPT(nn.Module):
+# --- MAIN MODEL (Renamed to match train.py) ---
+class GPT(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
