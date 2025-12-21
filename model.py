@@ -3,98 +3,62 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# --- CONFIGURATION (Renamed to match train.py) ---
+# --- CONFIGURATION ---
 class GPTConfig:
     def __init__(self, vocab_size=4096, block_size=1024):
         self.vocab_size = vocab_size
-        self.d_model = 768        # Standard 124M Width
-        self.n_layer = 12         # Standard 124M Depth
-        self.n_head = 12          # 12 Heads (64 dim per head)
-        self.block_size = block_size    # Trained Context (Fast)
+        self.d_model = 768
+        self.n_layer = 12
+        self.n_head = 12
+        self.block_size = block_size
         self.dropout = 0.0
-        self.ffn_type = "gated_deep_mlp"
+        self.bias = False 
+        self.untie_embeddings = True 
 
-# --- DYNAMIC YaRN RoPE ---
+# --- ROTARY EMBEDDING ---
 class RotaryEmbedding(nn.Module):
-    def __init__(self, dim, max_seq_len=1024, original_max_seq_len=1024, base=10000.0):
+    def __init__(self, dim, max_seq_len=1024):
         super().__init__()
-        self.dim = dim
-        self.base = base
-        self.original_max_seq_len = original_max_seq_len
-        self.max_seq_len = max_seq_len
-        self.register_buffer("inv_freq", self._compute_inv_freq(base), persistent=False)
+        inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
+        self.register_buffer("inv_freq", inv_freq)
 
-    def _compute_inv_freq(self, base):
-        return 1.0 / (base ** (torch.arange(0, self.dim, 2).float() / self.dim))
-
-    def _yarn_linear_ramp_mask(self, min_val, max_val, num_rotations):
-        if min_val == max_val:
-            return torch.ones_like(num_rotations)
-        mask = (num_rotations - min_val) / (max_val - min_val)
-        return torch.clamp(mask, 0, 1)
-
-    def forward(self, x, seq_len=None):
-        current_seq_len = seq_len if seq_len is not None else x.shape[1]
-        scale = max(1.0, current_seq_len / self.original_max_seq_len)
-
-        if scale <= 1.0:
-            t = torch.arange(current_seq_len, device=x.device).type_as(self.inv_freq)
-            freqs = torch.einsum('i,j->ij', t, self.inv_freq)
-            emb = torch.cat((freqs, freqs), dim=-1)
-            return emb.cos()[None, None, :, :], emb.sin()[None, None, :, :]
-
-        new_base = self.base * (scale ** (self.dim / (self.dim - 2)))
-        inv_freq_yarn = self._compute_inv_freq(new_base).to(x.device)
-        
-        beta_fast = 32
-        beta_slow = 1
-        dim_indices = torch.arange(0, self.dim, 2, device=x.device).float()
-        ramp = self._yarn_linear_ramp_mask(beta_slow, beta_fast, dim_indices / self.dim)
-        inv_freq_yarn = inv_freq_yarn * (1 - ramp) + (self.inv_freq.to(x.device) / scale) * ramp
-
-        mscale = 0.1 * math.log(scale) + 1.0
-        
-        t = torch.arange(current_seq_len, device=x.device).type_as(inv_freq_yarn)
-        freqs = torch.einsum('i,j->ij', t, inv_freq_yarn)
+    def forward(self, x):
+        # Reads the sequence length from the input tensor dimensions
+        seq_len = x.shape[1] 
+        t = torch.arange(seq_len, device=x.device, dtype=self.inv_freq.dtype)
+        freqs = torch.einsum("i,j->ij", t, self.inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)
-
-        return (emb.cos() * mscale)[None, None, :, :], (emb.sin() * mscale)[None, None, :, :]
-
-def rotate_half(x):
-    x1, x2 = x[..., :x.shape[-1]//2], x[..., x.shape[-1]//2:]
-    return torch.cat((-x2, x1), dim=-1)
+        return emb.cos()[None, None, :, :], emb.sin()[None, None, :, :]
 
 def apply_rotary_pos_emb(q, k, cos, sin):
+    def rotate_half(x):
+        x1, x2 = x[..., :x.shape[-1]//2], x[..., x.shape[-1]//2:]
+        return torch.cat((-x2, x1), dim=-1)
+    # Ensure cos/sin broadcast correctly across the batch and head dimensions
     return (q * cos) + (rotate_half(q) * sin), (k * cos) + (rotate_half(k) * sin)
 
 # --- LAYERS ---
 class RMSNorm(nn.Module):
-    def __init__(self, dim, eps=1e-6):
+    def __init__(self, dim, eps=1e-5):
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x):
-        var = torch.mean(x ** 2, dim=-1, keepdim=True)
-        return self.weight * x * torch.rsqrt(var + self.eps)
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * self.weight
 
 class GatedDeepMLP(nn.Module):
-    def __init__(self, dim):
+    def __init__(self, config):
         super().__init__()
-        hidden_dim = dim * 4
-        self.in_proj = nn.Linear(dim, hidden_dim, bias=False)
-        self.gate1 = nn.Linear(hidden_dim, hidden_dim, bias=False)
-        self.val1  = nn.Linear(hidden_dim, hidden_dim, bias=False)
-        self.gate2 = nn.Linear(hidden_dim, hidden_dim, bias=False)
-        self.val2  = nn.Linear(hidden_dim, hidden_dim, bias=False)
-        self.out_proj = nn.Linear(hidden_dim, dim, bias=False)
-        nn.init.zeros_(self.out_proj.weight)
+        hidden_dim = 4 * config.d_model 
+        self.gate_proj = nn.Linear(config.d_model, hidden_dim, bias=False)
+        self.up_proj   = nn.Linear(config.d_model, hidden_dim, bias=False)
+        self.down_proj = nn.Linear(hidden_dim, config.d_model, bias=False)
 
     def forward(self, x):
-        x = self.in_proj(x)
-        x = x + F.silu(self.gate1(x)) * self.val1(x)
-        x = x + F.silu(self.gate2(x)) * self.val2(x)
-        return self.out_proj(x)
+        gate = F.silu(self.gate_proj(x)) 
+        val  = self.up_proj(x)
+        return self.down_proj(gate * val)
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, config):
@@ -103,17 +67,25 @@ class CausalSelfAttention(nn.Module):
         self.d_head = config.d_model // config.n_head
         self.c_attn = nn.Linear(config.d_model, 3 * config.d_model, bias=False)
         self.c_proj = nn.Linear(config.d_model, config.d_model, bias=False)
+        self.c_proj.weight.data.zero_() 
         self.rotary = RotaryEmbedding(self.d_head, max_seq_len=config.block_size)
 
     def forward(self, x):
         B, T, C = x.size()
         qkv = self.c_attn(x)
         q, k, v = qkv.split(C, dim=2)
+        
         q = q.view(B, T, self.n_head, self.d_head).transpose(1, 2)
         k = k.view(B, T, self.n_head, self.d_head).transpose(1, 2)
         v = v.view(B, T, self.n_head, self.d_head).transpose(1, 2)
 
-        cos, sin = self.rotary(v, seq_len=T)
+        # QK-Norm (Critical for stability with Muon)
+        q = F.rms_norm(q, (q.size(-1),))
+        k = F.rms_norm(k, (k.size(-1),))
+
+        # Apply RoPE
+        # We pass 'x' to get the correct sequence length (T)
+        cos, sin = self.rotary(x) 
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
         y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
@@ -126,14 +98,14 @@ class Block(nn.Module):
         self.ln1 = RMSNorm(config.d_model)
         self.attn = CausalSelfAttention(config)
         self.ln2 = RMSNorm(config.d_model)
-        self.ffn = GatedDeepMLP(config.d_model)
+        self.mlp = GatedDeepMLP(config) 
 
     def forward(self, x):
         x = x + self.attn(self.ln1(x))
-        x = x + self.ffn(self.ln2(x))
+        x = x + self.mlp(self.ln2(x))
         return x
 
-# --- MAIN MODEL (Renamed to match train.py) ---
+# --- MAIN MODEL ---
 class GPT(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -142,7 +114,10 @@ class GPT(nn.Module):
         self.blocks = nn.Sequential(*[Block(config) for _ in range(config.n_layer)])
         self.ln_f = RMSNorm(config.d_model)
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
-        self.token_embedding.weight = self.lm_head.weight
+        
+        if not config.untie_embeddings:
+            self.token_embedding.weight = self.lm_head.weight
+        
         self.apply(self._init_weights)
 
     def _init_weights(self, module):
@@ -157,11 +132,44 @@ class GPT(nn.Module):
         x = self.blocks(x)
         x = self.ln_f(x)
         logits = self.lm_head(x)
+        
+        # Logit Softcapping (Prevents loss spikes)
+        logits = 30.0 * torch.tanh(logits / 30.0)
+
         loss = None
         if targets is not None:
-            B, T, C = logits.shape
-            loss = F.cross_entropy(logits.reshape(B*T, C), targets.reshape(B*T))
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+            
         return logits, loss
     
+    @torch.no_grad()
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
+        """
+        Generates new tokens using the trained model.
+        """
+        for _ in range(max_new_tokens):
+            # Crop context if it's too long
+            idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
+            
+            # Forward pass
+            logits, _ = self(idx_cond)
+            
+            # Get last step logits & scale by temperature
+            logits = logits[:, -1, :] / temperature
+            
+            # Top-K Sampling
+            if top_k is not None:
+                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                logits[logits < v[:, [-1]]] = -float('Inf')
+            
+            # Sample
+            probs = F.softmax(logits, dim=-1)
+            idx_next = torch.multinomial(probs, num_samples=1)
+            
+            # Append
+            idx = torch.cat((idx, idx_next), dim=1)
+
+        return idx
+        
     def get_num_params(self):
         return sum(p.numel() for p in self.parameters())
