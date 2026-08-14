@@ -1,4 +1,8 @@
-# GPT Prototype — 125M Transformer from First Principles
+<div align="center">
+
+![GPT Prototype — animated project overview](./docs/assets/readme/gpt-prototype-hero.svg)
+
+</div>
 
 [![PyTorch](https://img.shields.io/badge/PyTorch-transformer-ee4c2c?logo=pytorch&logoColor=white)](./model.py)
 [![Parameters](https://img.shields.io/badge/scale-≈125M-4d8dff)](./model.py)
